@@ -1,0 +1,12 @@
+# 密钥与配置：绝不能提交到仓库！
+config.json
+private_key.pem
+
+# 运行产物
+logs/
+__pycache__/
+*.pyc
+run.log
+
+# 状态库需要提交（用于跨轮次保存提醒次数），故意不忽略
+# state.db

@@ -1,0 +1,116 @@
+# 定制公交余票监控 · GitHub Actions 定时任务
+#
+# 每次运行：还原 state.db → 查询一次余票 → 有余票就推微信 → 只在「产生了推送」时才把状态提交回仓库
+#
+# ⚠️ 部署前必做（详见 ../README-GitHub部署.md）：
+#   1. 仓库 Settings → Secrets and variables → Actions 添加两个 Secret：
+#        CONFIG_JSON       = config.json 的完整内容
+#        PRIVATE_KEY_PEM   = private_key.pem 的完整内容
+#   2. Settings → Actions → General → Workflow permissions 选 Read and write permissions
+#
+# 频率选择（重要）：
+#   公开仓库 → 完全免费不计分钟，用 */5
+#   私有仓库 → 每月 2000 分钟，用 */15（*/5 约需 4300 分钟，会超额停跑）
+
+name: 余票监控
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    # 私有仓库请注释掉上面这行，改用下面这行：
+    # - cron: "*/15 * * * *"
+  workflow_dispatch: {}        # 支持手动触发，首次部署用它测试
+
+# 同一时刻只跑一个实例：避免两次运行同时读写 state.db 造成状态错乱
+concurrency:
+  group: bus-ticket-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # 需要写权限把 state.db 提交回仓库
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 写入配置与私钥
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          PRIVATE_KEY_PEM: ${{ secrets.PRIVATE_KEY_PEM }}
+        run: |
+          set -e
+          [ -n "$CONFIG_JSON" ]     || { echo "缺少 Secret: CONFIG_JSON"; exit 1; }
+          [ -n "$PRIVATE_KEY_PEM" ] || { echo "缺少 Secret: PRIVATE_KEY_PEM"; exit 1; }
+          printf '%s' "$CONFIG_JSON" > config.json
+          printf '%s' "$PRIVATE_KEY_PEM" > private_key.pem
+          chmod 600 private_key.pem
+          python -c "import json;json.load(open('config.json'));print('config.json 校验通过')"
+
+      # ------------------------------------------------------------------
+      # 状态持久化说明（这里踩过坑，别随便改）
+      #
+      # state.db 记录：今日已提醒次数、票情指纹、登录告警去重日期。
+      # 不持久化 → 每轮都当新的一天 → 每 5 分钟推一条，一天 288 条刷屏。
+      #
+      # 但也不能每轮都 commit（一天 288 次提交会撑爆仓库历史）。
+      # 策略：先尝试从仓库读上一版，跑完后【仅当本轮真的推送过】才提交回去。
+      # 这样提交次数 = 实际推送次数（一天最多几条），仓库干净。
+      #
+      # 没有 state.db 时的最坏情况：同一天可能多推几次（因为计数被重置），
+      # 但绝不会无限刷屏——因为只要推送成功就会立刻把状态提交回仓库。
+      # ------------------------------------------------------------------
+
+      - name: 查询余票并推送
+        id: run
+        env:
+          TZ: Asia/Shanghai
+        run: |
+          set +e
+          python -u monitor.py --once 2>&1 | tee run.log
+          code=${PIPESTATUS[0]}
+          # 提取脚本输出的结构化结果
+          line=$(grep -o '::MONITOR_RESULT.*' run.log | tail -1)
+          alerted=$(echo "$line" | sed -n 's/.*alerted=\([a-z]*\).*/\1/p')
+          [ -z "$alerted" ] && alerted=false
+          echo "alerted=$alerted" >> "$GITHUB_OUTPUT"
+          echo "本轮是否推送: $alerted （脚本退出码 $code）"
+          # 查询失败也让后续步骤执行（保留日志便于排查），但本步标红
+          exit $code
+
+      - name: 清理密钥
+        if: always()
+        run: rm -f config.json private_key.pem
+
+      - name: 保存监控状态（仅本轮推送过才提交）
+        if: always() && steps.run.outputs.alerted == 'true'
+        run: |
+          set -e
+          git config user.name  "bus-monitor-bot"
+          git config user.email "bus-monitor-bot@users.noreply.github.com"
+          if [ -f state.db ]; then
+            git add -f state.db
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: 更新监控状态 [skip ci]"
+              git push
+              echo "状态已提交回仓库"
+            else
+              echo "状态无变化"
+            fi
+          else
+            echo "未生成 state.db，跳过"
+          fi
